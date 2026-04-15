@@ -3,20 +3,19 @@ data_ingestion.py — async data-ingestion layer for the stock-analysis system.
 
 Responsibilities
 ----------------
-* Fetch OHLCV price history and fundamental ratios (P/E, EPS, revenue) via
-  yfinance (runs in a thread-pool to avoid blocking the event loop).
-* Fetch recent news articles per ticker from NewsAPI using httpx async calls.
-* Cache every result to SQLite (aiosqlite) with configurable TTLs:
-    - prices / fundamentals : 15 minutes
-    - news articles         : 1 hour
-* Expose a single entry-point:
-    DataIngestion.get_stock_data(tickers) -> dict
+* get_ohlcv(tickers)       — 1-year daily OHLCV via yfinance (thread-pool)
+* get_fundamentals(tickers) — P/E, EPS, revenue growth, market cap via yfinance
+* get_news(tickers)        — last 7 days of articles via NewsAPI (httpx async)
+* get_options_iv(tickers)  — ATM implied volatility from nearest-expiry options chain
+* get_stock_data(tickers)  — unified method combining all four above
+* All results cached to SQLite (aiosqlite) with configurable TTLs
 
-Schema (see db/schema.sql)
---------------------------
-    prices          (ticker, data JSON, fetched_at, ttl_expires_at)
-    fundamentals    (ticker, pe_ratio, eps, revenue, data JSON, fetched_at, ttl_expires_at)
-    news_articles   (ticker, data JSON, fetched_at, ttl_expires_at)
+Cache TTLs
+----------
+    prices / fundamentals : 15 minutes
+    news / IV             : 1 hour
+
+Schema: see db/schema.sql
 """
 
 from __future__ import annotations
@@ -24,25 +23,27 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any
 
 import aiosqlite
 import httpx
+import numpy as np
 import yfinance as yf
 
 from config import settings
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Internal helpers
 # ---------------------------------------------------------------------------
 
-_SCHEMA_PATH = __file__.replace("data_ingestion.py", "db/schema.sql")
+_SCHEMA_PATH = Path(__file__).parent / "db" / "schema.sql"
 
 
 async def _ensure_schema(db: aiosqlite.Connection) -> None:
-    """Create tables if they don't exist yet."""
-    with open(_SCHEMA_PATH) as fh:
-        sql = fh.read()
+    """Create tables from schema.sql if they don't exist yet."""
+    sql = _SCHEMA_PATH.read_text()
     await db.executescript(sql)
     await db.commit()
 
@@ -55,14 +56,20 @@ def _now() -> float:
 # DataIngestion
 # ---------------------------------------------------------------------------
 
+
 class DataIngestion:
     """
-    Async data-ingestion class.
+    Async data-ingestion class for OHLCV, fundamentals, news, and options IV.
+
+    Must be used as an async context manager::
+
+        async with DataIngestion() as ing:
+            data = await ing.get_stock_data(["AAPL", "NVDA"])
 
     Parameters
     ----------
-    db_path : str
-        Path to the SQLite database file.  Defaults to settings.db_path.
+    db_path : str, optional
+        Path to the SQLite database.  Defaults to ``settings.db_path``.
     """
 
     def __init__(self, db_path: str | None = None) -> None:
@@ -70,7 +77,7 @@ class DataIngestion:
         self._db: aiosqlite.Connection | None = None
 
     # ------------------------------------------------------------------
-    # Context-manager support
+    # Context manager
     # ------------------------------------------------------------------
 
     async def __aenter__(self) -> "DataIngestion":
@@ -84,201 +91,330 @@ class DataIngestion:
             await self._db.close()
             self._db = None
 
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
+    # ==================================================================
+    # Public methods
+    # ==================================================================
 
     async def get_stock_data(self, tickers: list[str]) -> dict[str, Any]:
         """
-        Fetch prices, fundamentals, and news for every ticker in *tickers*.
+        Fetch OHLCV, fundamentals, news, and options IV for every ticker.
 
-        Returns a dict keyed by ticker::
+        Tickers are processed in parallel via ``asyncio.gather``.
 
-            {
-              "AAPL": {
-                "prices":       [...],   # list of OHLCV dicts
-                "fundamentals": {...},   # P/E, EPS, revenue + raw blob
-                "news":         [...],   # list of article dicts
-              },
-              ...
-            }
+        Returns
+        -------
+        dict
+            ``{ticker: {prices, fundamentals, news, options_iv}}``
         """
-        if self._db is None:
-            raise RuntimeError(
-                "DataIngestion must be used as an async context manager."
-            )
-
+        self._require_db()
         results = await asyncio.gather(
-            *[self._fetch_ticker(ticker) for ticker in tickers],
+            *[self._fetch_all_for_ticker(t) for t in tickers],
             return_exceptions=True,
         )
-
-        output: dict[str, Any] = {}
-        for ticker, result in zip(tickers, results):
-            if isinstance(result, Exception):
-                output[ticker] = {"error": str(result)}
-            else:
-                output[ticker] = result
-        return output
-
-    # ------------------------------------------------------------------
-    # Per-ticker orchestration
-    # ------------------------------------------------------------------
-
-    async def _fetch_ticker(self, ticker: str) -> dict[str, Any]:
-        prices_task       = asyncio.create_task(self._get_prices(ticker))
-        fundamentals_task = asyncio.create_task(self._get_fundamentals(ticker))
-        news_task         = asyncio.create_task(self._get_news(ticker))
-
-        prices, fundamentals, news = await asyncio.gather(
-            prices_task, fundamentals_task, news_task,
-            return_exceptions=True,
-        )
-
         return {
-            "prices":       prices       if not isinstance(prices,       Exception) else {"error": str(prices)},
-            "fundamentals": fundamentals if not isinstance(fundamentals, Exception) else {"error": str(fundamentals)},
-            "news":         news         if not isinstance(news,         Exception) else {"error": str(news)},
+            ticker: result if not isinstance(result, Exception) else {"error": str(result)}
+            for ticker, result in zip(tickers, results)
         }
 
-    # ------------------------------------------------------------------
-    # Price data (yfinance)
-    # ------------------------------------------------------------------
+    async def get_ohlcv(self, tickers: list[str]) -> dict[str, list[dict]]:
+        """
+        Return 1-year daily OHLCV records for each ticker.
+
+        Returns
+        -------
+        dict
+            ``{ticker: [{date, open, high, low, close, volume}, ...]}``
+        """
+        self._require_db()
+        results = await asyncio.gather(
+            *[self._get_prices(t) for t in tickers], return_exceptions=True
+        )
+        return {
+            t: r if not isinstance(r, Exception) else []
+            for t, r in zip(tickers, results)
+        }
+
+    async def get_fundamentals(self, tickers: list[str]) -> dict[str, dict]:
+        """
+        Return fundamental ratios (P/E, EPS, revenue growth, market cap) per ticker.
+
+        Returns
+        -------
+        dict
+            ``{ticker: {pe_ratio, eps, revenue_growth, market_cap, ...}}``
+        """
+        self._require_db()
+        results = await asyncio.gather(
+            *[self._get_fundamentals(t) for t in tickers], return_exceptions=True
+        )
+        return {
+            t: r if not isinstance(r, Exception) else {}
+            for t, r in zip(tickers, results)
+        }
+
+    async def get_news(self, tickers: list[str]) -> dict[str, list[dict]]:
+        """
+        Return the last 7 days of news articles per ticker via NewsAPI.
+
+        Returns
+        -------
+        dict
+            ``{ticker: [{title, description, url, source, published_at}, ...]}``
+        """
+        self._require_db()
+        results = await asyncio.gather(
+            *[self._get_news(t) for t in tickers], return_exceptions=True
+        )
+        return {
+            t: r if not isinstance(r, Exception) else []
+            for t, r in zip(tickers, results)
+        }
+
+    async def get_options_iv(self, tickers: list[str]) -> dict[str, float | None]:
+        """
+        Return ATM implied volatility from the nearest-expiry options chain.
+
+        Queries ``yfinance`` in a thread-pool executor to avoid blocking.
+
+        Returns
+        -------
+        dict
+            ``{ticker: iv_float_or_None}``
+        """
+        self._require_db()
+        results = await asyncio.gather(
+            *[self._get_iv(t) for t in tickers], return_exceptions=True
+        )
+        return {
+            t: r if not isinstance(r, Exception) else None
+            for t, r in zip(tickers, results)
+        }
+
+    # ==================================================================
+    # Per-ticker orchestration (private)
+    # ==================================================================
+
+    async def _fetch_all_for_ticker(self, ticker: str) -> dict[str, Any]:
+        prices, fundamentals, news, iv = await asyncio.gather(
+            self._get_prices(ticker),
+            self._get_fundamentals(ticker),
+            self._get_news(ticker),
+            self._get_iv(ticker),
+            return_exceptions=True,
+        )
+        return {
+            "prices":      prices       if not isinstance(prices,       Exception) else [],
+            "fundamentals":fundamentals if not isinstance(fundamentals, Exception) else {},
+            "news":        news         if not isinstance(news,         Exception) else [],
+            "options_iv":  iv           if not isinstance(iv,           Exception) else None,
+        }
+
+    # ==================================================================
+    # OHLCV — 1 year daily
+    # ==================================================================
 
     async def _get_prices(self, ticker: str) -> list[dict[str, Any]]:
         cached = await self._cache_get("prices", ticker)
         if cached is not None:
             return cached
-
-        data = await asyncio.get_event_loop().run_in_executor(
-            None, self._fetch_prices_sync, ticker
-        )
+        loop = asyncio.get_event_loop()
+        data = await loop.run_in_executor(None, self._fetch_prices_sync, ticker)
         await self._cache_set("prices", ticker, data, settings.price_ttl)
         return data
 
     @staticmethod
     def _fetch_prices_sync(ticker: str) -> list[dict[str, Any]]:
-        tf = yf.Ticker(ticker)
-        hist = tf.history(period="1mo", interval="1d")
+        hist = yf.Ticker(ticker).history(period="1y", interval="1d")
         records = []
         for ts, row in hist.iterrows():
-            records.append({
-                "date":   ts.isoformat(),
-                "open":   round(float(row["Open"]),   4),
-                "high":   round(float(row["High"]),   4),
-                "low":    round(float(row["Low"]),    4),
-                "close":  round(float(row["Close"]),  4),
-                "volume": int(row["Volume"]),
-            })
+            records.append(
+                {
+                    "date":   ts.isoformat(),
+                    "open":   round(float(row["Open"]),  4),
+                    "high":   round(float(row["High"]),  4),
+                    "low":    round(float(row["Low"]),   4),
+                    "close":  round(float(row["Close"]), 4),
+                    "volume": int(row["Volume"]),
+                }
+            )
         return records
 
-    # ------------------------------------------------------------------
-    # Fundamental data (yfinance)
-    # ------------------------------------------------------------------
+    # ==================================================================
+    # Fundamentals
+    # ==================================================================
 
     async def _get_fundamentals(self, ticker: str) -> dict[str, Any]:
         cached = await self._cache_get("fundamentals", ticker)
         if cached is not None:
             return cached
-
-        data = await asyncio.get_event_loop().run_in_executor(
-            None, self._fetch_fundamentals_sync, ticker
-        )
+        loop = asyncio.get_event_loop()
+        data = await loop.run_in_executor(None, self._fetch_fundamentals_sync, ticker)
         await self._cache_set("fundamentals", ticker, data, settings.price_ttl)
         return data
 
     @staticmethod
     def _fetch_fundamentals_sync(ticker: str) -> dict[str, Any]:
-        tf = yf.Ticker(ticker)
-        info = tf.info or {}
+        info = yf.Ticker(ticker).info or {}
 
-        pe_ratio = info.get("trailingPE") or info.get("forwardPE")
-        eps      = info.get("trailingEps") or info.get("forwardEps")
-        revenue  = info.get("totalRevenue")
+        # Revenue growth: prefer quarterly, fall back to annual
+        revenue_growth = info.get("revenueGrowth") or info.get("earningsGrowth")
 
         return {
-            "pe_ratio":         pe_ratio,
-            "eps":              eps,
-            "revenue":          revenue,
-            "market_cap":       info.get("marketCap"),
-            "dividend_yield":   info.get("dividendYield"),
-            "52w_high":         info.get("fiftyTwoWeekHigh"),
-            "52w_low":          info.get("fiftyTwoWeekLow"),
-            "beta":             info.get("beta"),
-            "sector":           info.get("sector"),
-            "industry":         info.get("industry"),
+            "pe_ratio":       info.get("trailingPE") or info.get("forwardPE"),
+            "eps":            info.get("trailingEps") or info.get("forwardEps"),
+            "eps_growth":     info.get("earningsGrowth"),
+            "revenue":        info.get("totalRevenue"),
+            "revenue_growth": revenue_growth,
+            "market_cap":     info.get("marketCap"),
+            "dividend_yield": info.get("dividendYield"),
+            "beta":           info.get("beta"),
+            "52w_high":       info.get("fiftyTwoWeekHigh"),
+            "52w_low":        info.get("fiftyTwoWeekLow"),
+            "sector":         info.get("sector"),
+            "industry":       info.get("industry"),
         }
 
-    # ------------------------------------------------------------------
-    # News (NewsAPI via httpx async)
-    # ------------------------------------------------------------------
+    # ==================================================================
+    # News — last 7 days via NewsAPI
+    # ==================================================================
 
     async def _get_news(self, ticker: str) -> list[dict[str, Any]]:
         cached = await self._cache_get("news_articles", ticker)
         if cached is not None:
             return cached
-
         if not settings.news_api_key:
             return []
-
         articles = await self._fetch_news_async(ticker)
         await self._cache_set("news_articles", ticker, articles, settings.news_ttl)
         return articles
 
     async def _fetch_news_async(self, ticker: str) -> list[dict[str, Any]]:
-        url = f"{settings.newsapi_base_url}/everything"
+        from_date = (
+            datetime.now(timezone.utc) - timedelta(days=settings.newsapi_days)
+        ).strftime("%Y-%m-%d")
+
         params = {
             "q":        ticker,
+            "from":     from_date,
             "sortBy":   "publishedAt",
             "pageSize": settings.newsapi_page_size,
             "language": "en",
             "apiKey":   settings.news_api_key,
         }
+        url = f"{settings.newsapi_base_url}/everything"
 
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            response = await client.get(url, params=params)
-            response.raise_for_status()
-            payload = response.json()
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.get(url, params=params)
+            resp.raise_for_status()
+            payload = resp.json()
 
-        articles = []
-        for article in payload.get("articles", []):
-            articles.append({
-                "title":       article.get("title"),
-                "description": article.get("description"),
-                "url":         article.get("url"),
-                "source":      article.get("source", {}).get("name"),
-                "published_at":article.get("publishedAt"),
-            })
-        return articles
+        return [
+            {
+                "title":        a.get("title"),
+                "description":  a.get("description"),
+                "url":          a.get("url"),
+                "source":       a.get("source", {}).get("name"),
+                "published_at": a.get("publishedAt"),
+            }
+            for a in payload.get("articles", [])
+        ]
 
-    # ------------------------------------------------------------------
+    # ==================================================================
+    # Options IV — nearest-expiry ATM strike
+    # ==================================================================
+
+    async def _get_iv(self, ticker: str) -> float | None:
+        cached = await self._cache_get("iv_data", ticker)
+        if cached is not None:
+            return cached.get("iv") if isinstance(cached, dict) else cached
+        loop = asyncio.get_event_loop()
+        iv = await loop.run_in_executor(None, self._fetch_iv_sync, ticker)
+        await self._cache_set("iv_data", ticker, {"iv": iv}, settings.iv_ttl)
+        return iv
+
+    @staticmethod
+    def _fetch_iv_sync(ticker: str) -> float | None:
+        """
+        Fetch ATM implied volatility from the nearest-expiry options chain.
+
+        Strategy
+        --------
+        1. Get current spot price.
+        2. Pick the nearest expiry that has at least 5 days to expiration.
+        3. From the call chain, find the strike closest to spot.
+        4. Return that strike's ``impliedVolatility``.
+        """
+        try:
+            tk = yf.Ticker(ticker)
+            spot = tk.info.get("regularMarketPrice") or tk.info.get("currentPrice")
+            if spot is None:
+                hist = tk.history(period="2d")
+                if hist.empty:
+                    return None
+                spot = float(hist["Close"].iloc[-1])
+
+            expirations = tk.options
+            if not expirations:
+                return None
+
+            # Pick first expiry with >= 5 calendar days out
+            today = datetime.now(timezone.utc).date()
+            chosen_expiry = None
+            for exp_str in expirations:
+                exp_date = datetime.strptime(exp_str, "%Y-%m-%d").date()
+                if (exp_date - today).days >= 5:
+                    chosen_expiry = exp_str
+                    break
+            if chosen_expiry is None:
+                chosen_expiry = expirations[0]
+
+            chain = tk.option_chain(chosen_expiry)
+            calls = chain.calls
+            if calls is None or calls.empty:
+                return None
+
+            # ATM = strike closest to spot
+            calls = calls[calls["impliedVolatility"] > 0].copy()
+            if calls.empty:
+                return None
+            idx = (calls["strike"] - spot).abs().idxmin()
+            iv = float(calls.loc[idx, "impliedVolatility"])
+            return round(iv, 6)
+        except Exception:
+            return None
+
+    # ==================================================================
     # SQLite cache helpers
-    # ------------------------------------------------------------------
+    # ==================================================================
+
+    def _require_db(self) -> None:
+        if self._db is None:
+            raise RuntimeError(
+                "DataIngestion must be used as an async context manager."
+            )
 
     async def _cache_get(
         self, table: str, ticker: str
-    ) -> list[Any] | dict[str, Any] | None:
-        """Return cached data if a fresh (non-expired) row exists, else None."""
+    ) -> Any | None:
+        """Return cached payload if a live row exists, else None."""
         now = _now()
         async with self._db.execute(
-            f"SELECT data FROM {table} WHERE ticker = ? AND ttl_expires_at > ? "
+            f"SELECT data FROM {table} "
+            f"WHERE ticker = ? AND ttl_expires_at > ? "
             f"ORDER BY fetched_at DESC LIMIT 1",
             (ticker, now),
-        ) as cursor:
-            row = await cursor.fetchone()
-        if row is None:
-            return None
-        return json.loads(row["data"])
+        ) as cur:
+            row = await cur.fetchone()
+        return json.loads(row["data"]) if row else None
 
     async def _cache_set(
         self, table: str, ticker: str, data: Any, ttl: int
     ) -> None:
-        """Insert a fresh cache row; prune expired rows for this ticker."""
+        """Upsert a cache row; prune expired rows for this ticker."""
         now        = _now()
         expires_at = now + ttl
         blob       = json.dumps(data)
 
-        # Prune stale rows first to keep the table lean
         await self._db.execute(
             f"DELETE FROM {table} WHERE ticker = ? AND ttl_expires_at <= ?",
             (ticker, now),
@@ -292,44 +428,40 @@ class DataIngestion:
 
 
 # ---------------------------------------------------------------------------
-# __main__ — quick smoke-test
+# __main__ — smoke-test
 # ---------------------------------------------------------------------------
+
 
 async def _main() -> None:
     tickers = ["AAPL", "NVDA", "MSFT"]
+    print(f"Testing DataIngestion with tickers: {tickers}\n")
 
-    async with DataIngestion() as ingestion:
-        print(f"Fetching data for {tickers} …")
-        result = await ingestion.get_stock_data(tickers)
+    async with DataIngestion() as ing:
+        data = await ing.get_stock_data(tickers)
 
-    for ticker, data in result.items():
-        print(f"\n{'='*60}")
+    for ticker, d in data.items():
+        print(f"{'='*60}")
         print(f"  {ticker}")
         print(f"{'='*60}")
 
-        prices = data.get("prices", [])
-        if isinstance(prices, list) and prices:
+        prices = d.get("prices", [])
+        if prices:
             latest = prices[-1]
-            print(f"  Latest close : {latest['close']}  ({latest['date'][:10]})")
-            print(f"  OHLCV rows   : {len(prices)}")
+            print(f"  OHLCV rows   : {len(prices)}  (latest: {latest['date'][:10]} close={latest['close']})")
         else:
-            print(f"  Prices       : {prices}")
+            print(f"  OHLCV        : {prices}")
 
-        fundamentals = data.get("fundamentals", {})
-        if isinstance(fundamentals, dict):
-            print(f"  P/E ratio    : {fundamentals.get('pe_ratio')}")
-            print(f"  EPS          : {fundamentals.get('eps')}")
-            print(f"  Revenue      : {fundamentals.get('revenue')}")
-        else:
-            print(f"  Fundamentals : {fundamentals}")
+        f = d.get("fundamentals", {})
+        print(f"  P/E          : {f.get('pe_ratio')}")
+        print(f"  EPS          : {f.get('eps')}")
+        print(f"  Rev growth   : {f.get('revenue_growth')}")
+        print(f"  Market cap   : {f.get('market_cap')}")
 
-        news = data.get("news", [])
-        if isinstance(news, list) and news:
-            print(f"  News articles: {len(news)}")
-            for article in news[:2]:
-                print(f"    - {article.get('title', 'n/a')[:80]}")
-        else:
-            print(f"  News         : {news or 'no API key configured'}")
+        news = d.get("news", [])
+        print(f"  News         : {len(news)} articles{' (no key)' if not settings.news_api_key else ''}")
+
+        print(f"  Options IV   : {d.get('options_iv')}")
+        print()
 
 
 if __name__ == "__main__":

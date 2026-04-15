@@ -1,22 +1,37 @@
-# ── Core async I/O ──────────────────────────────────────────────────────────
-httpx>=0.27.0          # async HTTP client (NewsAPI calls)
-aiosqlite>=0.20.0      # async SQLite access
+# ── Async I/O ────────────────────────────────────────────────────────────────
+httpx>=0.27.0           # async HTTP (NewsAPI)
+aiosqlite>=0.20.0       # async SQLite caching
 
-# ── Market data ─────────────────────────────────────────────────────────────
-yfinance>=0.2.40       # OHLCV + fundamental data (wraps Yahoo Finance)
+# ── Market data ──────────────────────────────────────────────────────────────
+yfinance>=0.2.40        # OHLCV, fundamentals, options chains
+pandas-datareader>=0.10.0  # Fama-French factor data (famafrench reader)
 
-# ── Configuration ───────────────────────────────────────────────────────────
-python-dotenv>=1.0.0   # .env loading
+# ── Quantitative models ───────────────────────────────────────────────────────
+arch>=6.3.0             # EGARCH / GARCH models
+scikit-learn>=1.4.0     # LinearRegression for FF alpha
+numpy>=1.26.0
+pandas>=2.1.0
 
-# ── LLM backends (orchestrator.py) ──────────────────────────────────────────
-anthropic>=0.28.0      # Claude API (LLM_BACKEND=claude)
-openai>=1.30.0         # vLLM OpenAI-compatible client (LLM_BACKEND=vllm)
+# ── Sentiment analysis ────────────────────────────────────────────────────────
+transformers>=4.41.0    # FinBERT (ProsusAI/finbert)
+torch>=2.3.0            # CPU install: pip install torch --index-url https://download.pytorch.org/whl/cpu
+# optimum>=1.19.0       # optional: ONNX/BetterTransformer speedup
 
-# ── Sentiment analysis (sentiment.py — FinBERT) ──────────────────────────────
-transformers>=4.41.0
-torch>=2.3.0           # CPU-only install: pip install torch --index-url https://download.pytorch.org/whl/cpu
+# ── Forecasting ───────────────────────────────────────────────────────────────
+# Chronos-T5 from Amazon:
+#   pip install git+https://github.com/amazon-science/chronos-forecasting.git
+# Or, if published to PyPI:
+# chronos-forecasting>=1.3.0
 
-# ── Forecasting (forecasting.py — Chronos-T5) ────────────────────────────────
-# git+https://github.com/amazon-science/chronos-forecasting.git
-# Uncomment the line above once you are ready to use Chronos-T5.
-# It pulls in additional torch / huggingface dependencies.
+# ── XGBoost ranker ────────────────────────────────────────────────────────────
+xgboost>=2.0.0
+
+# ── Backtesting ───────────────────────────────────────────────────────────────
+vectorbt>=0.26.0
+
+# ── LLM backends ─────────────────────────────────────────────────────────────
+anthropic>=0.28.0       # Claude API (LLM_BACKEND=claude)
+openai>=1.30.0          # vLLM OpenAI-compatible client (LLM_BACKEND=vllm)
+
+# ── Config ────────────────────────────────────────────────────────────────────
+python-dotenv>=1.0.0
