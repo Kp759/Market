@@ -1,26 +1,29 @@
 # ── Async I/O ────────────────────────────────────────────────────────────────
-httpx>=0.27.0           # async HTTP (NewsAPI)
-aiosqlite>=0.20.0       # async SQLite caching
+httpx>=0.27.0              # async HTTP (NewsAPI, FINRA, EDGAR, IWM CSV)
+aiosqlite>=0.20.0          # async SQLite caching
 
-# ── Market data ──────────────────────────────────────────────────────────────
-yfinance>=0.2.40        # OHLCV, fundamentals, options chains
-pandas-datareader>=0.10.0  # Fama-French factor data (famafrench reader)
+# ── Market data ───────────────────────────────────────────────────────────────
+yfinance>=0.2.40           # OHLCV, fundamentals, options chains
+pandas-datareader>=0.10.0  # Fama-French factor data
+
+# ── HTML / CSV scraping ───────────────────────────────────────────────────────
+lxml>=5.1.0                # fast HTML parser for pd.read_html (Wikipedia)
+beautifulsoup4>=4.12.0     # fallback HTML parsing
+html5lib>=1.1              # another pd.read_html fallback parser
 
 # ── Quantitative models ───────────────────────────────────────────────────────
-arch>=6.3.0             # EGARCH / GARCH models
-scikit-learn>=1.4.0     # LinearRegression for FF alpha
+arch>=6.3.0                # EGARCH / GARCH
+scikit-learn>=1.4.0        # LinearRegression (Fama-French alpha)
 numpy>=1.26.0
 pandas>=2.1.0
 
 # ── Sentiment analysis ────────────────────────────────────────────────────────
-transformers>=4.41.0    # FinBERT (ProsusAI/finbert)
-torch>=2.3.0            # CPU install: pip install torch --index-url https://download.pytorch.org/whl/cpu
-# optimum>=1.19.0       # optional: ONNX/BetterTransformer speedup
+transformers>=4.41.0       # FinBERT (ProsusAI/finbert)
+torch>=2.3.0               # CPU: pip install torch --index-url https://download.pytorch.org/whl/cpu
 
-# ── Forecasting ───────────────────────────────────────────────────────────────
-# Chronos-T5 from Amazon:
+# ── Forecasting (optional — uncomment to enable Chronos-T5) ──────────────────
+# Install from source:
 #   pip install git+https://github.com/amazon-science/chronos-forecasting.git
-# Or, if published to PyPI:
 # chronos-forecasting>=1.3.0
 
 # ── XGBoost ranker ────────────────────────────────────────────────────────────
@@ -29,9 +32,9 @@ xgboost>=2.0.0
 # ── Backtesting ───────────────────────────────────────────────────────────────
 vectorbt>=0.26.0
 
-# ── LLM backends ─────────────────────────────────────────────────────────────
-anthropic>=0.28.0       # Claude API (LLM_BACKEND=claude)
-openai>=1.30.0          # vLLM OpenAI-compatible client (LLM_BACKEND=vllm)
+# ── LLM backends ──────────────────────────────────────────────────────────────
+anthropic>=0.28.0          # Claude API  (LLM_BACKEND=claude)
+openai>=1.30.0             # vLLM OpenAI-compatible  (LLM_BACKEND=vllm)
 
 # ── Config ────────────────────────────────────────────────────────────────────
 python-dotenv>=1.0.0

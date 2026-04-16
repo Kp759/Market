@@ -1,29 +1,37 @@
 """
-main.py — CLI entry-point for the stock-analysis system.
+main.py — CLI entry-point for the stock-screening system.
 
-Usage
+Modes
 -----
-Live analysis::
+screen   (default)
+    Build the ~1800-ticker universe, run the full screener pipeline,
+    call the LLM orchestrator, and print the top-20 ranked picks.
 
-    python main.py --tickers AAPL NVDA MSFT TSLA AMZN --mode live
+    python main.py --mode screen
 
-Backtest::
+backtest
+    Replay stored recommendations through the walk-forward vectorbt
+    backtester and print performance metrics.
 
     python main.py --mode backtest --start 2023-01-01 --end 2024-12-31
 
-Train XGBoost model on historical recommendations::
+train
+    Build a panel of historical recommendations + realised 60-day
+    forward returns and retrain the XGBoost model with walk-forward CV.
 
-    python main.py --tickers AAPL NVDA MSFT --mode train
+    python main.py --mode train
 
 Options
 -------
---tickers   One or more ticker symbols (default: AAPL NVDA MSFT TSLA AMZN)
---mode      live | backtest | train  (default: live)
---start     Backtest start date YYYY-MM-DD (default: 2023-01-01)
---end       Backtest end date   YYYY-MM-DD (default: today)
---db        SQLite database path (default: settings.db_path)
---backend   LLM backend: claude | vllm (overrides .env)
---no-llm    Skip LLM call; show composite scores only
+--mode      screen | backtest | train  (default: screen)
+--tickers   Explicit ticker list (overrides universe scrape)
+--top-n     Number of top picks to show (default: 20)
+--start     Backtest start date  YYYY-MM-DD
+--end       Backtest end date    YYYY-MM-DD
+--db        SQLite database path
+--backend   claude | vllm  (overrides .env LLM_BACKEND)
+--no-llm    Skip LLM call; print screener scores only
+--no-cache  Force-refresh universe and data (ignore TTL)
 """
 
 from __future__ import annotations
@@ -45,173 +53,183 @@ logging.basicConfig(
 )
 logger = logging.getLogger("main")
 
-DEFAULT_TICKERS = ["AAPL", "NVDA", "MSFT", "TSLA", "AMZN"]
-
 
 # ---------------------------------------------------------------------------
-# Modes
+# Mode: screen
 # ---------------------------------------------------------------------------
 
-
-async def run_live(
-    tickers: list[str],
+async def run_screen(
+    tickers: list[str] | None,
+    top_n: int,
     db_path: str,
     llm_backend: str,
     no_llm: bool,
 ) -> None:
-    """Fetch live data, compute all signals, print ranked table."""
+    """
+    Main screening pipeline.
+
+    1. Fetch universe (~1800 tickers) or use *tickers* if supplied.
+    2. Run Screener to get top_n candidates.
+    3. Optionally call LLM Orchestrator for buy-list + reasoning.
+    4. Print ranked table.
+    """
+    if not tickers:
+        from universe import get_tickers_async
+        logger.info("Fetching universe …")
+        tickers = await get_tickers_async(db_path)
+        logger.info("Universe size: %d tickers", len(tickers))
+
+    from screener import Screener
+    sc = Screener(db_path=db_path, top_n=top_n)
+    logger.info("Running screener on %d tickers …", len(tickers))
+    screener_df = await sc.screen(tickers, top_n=top_n)
+
     if no_llm:
-        await _run_signals_only(tickers, db_path)
+        _print_table(screener_df)
         return
 
     from orchestrator import Orchestrator
-
     orch = Orchestrator(llm_backend=llm_backend, db_path=db_path)
-    logger.info("Running live pipeline for %s …", tickers)
-    df = await orch.run(tickers)
+    logger.info("Calling LLM orchestrator (%s) …", llm_backend)
+    final_df = await orch.run(screener_df=screener_df)
 
-    _print_table(df)
+    output_cols = [
+        "ticker", "score", "recommendation",
+        "position_size_kelly", "position_size_equal",
+        "momentum", "sue_score", "short_squeeze",
+        "sentiment_score", "egarch_vol", "iv_spread",
+        "sector", "risk_flag",
+    ]
+    _print_table(final_df[[c for c in output_cols if c in final_df.columns]])
+
+    # Also print justifications
+    print("\n── Justifications ─────────────────────────────────────────")
+    for _, row in final_df.iterrows():
+        if row.get("recommendation") == "buy":
+            print(f"\n  {row['ticker']}  [{row.get('recommendation','?')}]")
+            print(f"  {row.get('justification','')}")
+            if row.get("risk_flag"):
+                print(f"  Risk: {row['risk_flag']}")
 
 
-async def _run_signals_only(tickers: list[str], db_path: str) -> None:
-    """Run data ingestion + quant signals only (no LLM call)."""
-    import numpy as np
-    from data_ingestion import DataIngestion
-    from quant_models import QuantModels
-    from sentiment import SentimentAnalyzer
-
-    qm       = QuantModels()
-    analyzer = SentimentAnalyzer()
-    analyzer.load()
-
-    async with DataIngestion(db_path) as ing:
-        raw = await ing.get_stock_data(tickers)
-
-    rows = []
-    for ticker, d in raw.items():
-        prices = d.get("prices", [])
-        fund   = d.get("fundamentals") or {}
-
-        egarch_vol = None
-        if len(prices) >= 30:
-            closes  = np.array([p["close"] for p in prices], dtype=float)
-            log_ret = pd.Series(np.log(closes)).diff().dropna()
-            try:
-                eg = qm.fit_egarch(log_ret)
-                egarch_vol = eg["vol_forecast"]
-            except Exception:
-                pass
-
-        news   = d.get("news", [])
-        texts  = [a.get("title", "") for a in news] + [a.get("description", "") for a in news]
-        sent   = analyzer.score_articles([t for t in texts if t])
-
-        rows.append(
-            {
-                "ticker":     ticker,
-                "sentiment":  round(sent, 4),
-                "egarch_vol": round(egarch_vol, 4) if egarch_vol else None,
-                "pe_ratio":   fund.get("pe_ratio"),
-                "eps":        fund.get("eps"),
-                "market_cap": fund.get("market_cap"),
-                "iv":         d.get("options_iv"),
-            }
-        )
-
-    df = pd.DataFrame(rows)
-    _print_table(df)
-
+# ---------------------------------------------------------------------------
+# Mode: backtest
+# ---------------------------------------------------------------------------
 
 def run_backtest(start: str, end: str, db_path: str) -> None:
-    """Replay stored recommendations and print performance metrics."""
+    """Walk-forward backtest of stored recommendations."""
     from backtest import Backtester
 
     bt = Backtester(db_path=db_path)
     try:
         result = bt.run(start=start, end=end)
         print(result.summary())
+        print()
+        print("Monthly PnL:")
+        _print_table(result.monthly_pnl)
     except ValueError as exc:
         logger.error("%s", exc)
         sys.exit(1)
 
 
-async def run_train(tickers: list[str], db_path: str) -> None:
-    """
-    Build training data from stored recommendations and fit XGBoost model.
+# ---------------------------------------------------------------------------
+# Mode: train
+# ---------------------------------------------------------------------------
 
-    Computes realised 1-month forward returns for each ticker on each
-    recommendation date, then trains the XGBoost regressor.
+async def run_train(db_path: str, start: str = "2020-01-01") -> None:
+    """
+    Retrain the XGBoost model using walk-forward cross-validation.
+
+    Loads all stored recommendations, downloads 60-day forward price
+    returns for each, assembles a panel, and calls
+    ``ReturnPredictor.train_walkforward()``.
     """
     import numpy as np
     import yfinance as yf
     from backtest import Backtester
     from xgb_ranker import ReturnPredictor, FEATURE_COLS
 
-    logger.info("Loading stored recommendations …")
+    logger.info("Loading stored recommendations for walk-forward training …")
     bt   = Backtester(db_path=db_path)
-    recs = bt.load_recommendations(start="2020-01-01", end=str(date.today()))
+    recs = bt.load_recommendations(start=start, end=str(date.today()))
 
     if recs.empty:
-        logger.error("No recommendations found. Run --mode live first.")
+        logger.error(
+            "No recommendations found. Run --mode screen first to populate the DB."
+        )
         sys.exit(1)
 
     all_tickers = sorted(recs["ticker"].unique().tolist())
-    logger.info("Downloading price data for forward-return computation …")
+    logger.info("Downloading prices for %d tickers …", len(all_tickers))
     prices = yf.download(
         all_tickers,
-        start=str(recs["date"].min().date()),
+        start=start,
         end=str(date.today()),
         interval="1d",
         auto_adjust=True,
         progress=False,
     )["Close"].ffill()
 
-    predictor = ReturnPredictor()
-    feature_rows = []
-    return_rows  = []
-
+    panel_rows: list[dict] = []
     for _, row in recs.iterrows():
-        t    = row["ticker"]
-        dt   = row["date"]
+        t  = row["ticker"]
+        dt = row["date"]
         if t not in prices.columns:
             continue
-        fwd_idx = prices.index.searchsorted(dt)
-        if fwd_idx + 21 >= len(prices):
+        idx = prices.index.searchsorted(dt)
+        if idx + 60 >= len(prices):
             continue
-        p0 = prices[t].iloc[fwd_idx]
-        p1 = prices[t].iloc[fwd_idx + 21]
+        p0 = prices[t].iloc[idx]
+        p1 = prices[t].iloc[idx + 60]
         if pd.isna(p0) or pd.isna(p1) or p0 == 0:
             continue
-        fwd_return = (p1 - p0) / p0
+        fwd60 = (p1 - p0) / p0
 
-        feature_rows.append({"ticker": t, "score": row["score"]})
-        return_rows.append({"ticker": t, "fwd_return": fwd_return})
+        panel_rows.append({
+            "date":          dt,
+            "ticker":        t,
+            "fwd_return_60d":fwd60,
+            "score":         float(row.get("score") or 0),
+            # remaining features default to 0; real pipeline would join signals
+            **{col: 0.0 for col in FEATURE_COLS if col != "score"},
+        })
 
-    if not feature_rows:
-        logger.error("Could not construct any feature rows. Aborting.")
+    if not panel_rows:
+        logger.error("Could not build any training rows. Aborting.")
         sys.exit(1)
 
-    feat_df = pd.DataFrame(feature_rows).set_index("ticker")
-    # Pad missing features with 0
+    panel_df = pd.DataFrame(panel_rows)
+    # Ensure all feature columns exist
     for col in FEATURE_COLS:
-        if col not in feat_df.columns:
-            feat_df[col] = 0.0
-    feat_df = feat_df[FEATURE_COLS]
+        if col not in panel_df.columns:
+            panel_df[col] = 0.0
 
-    fwd_series = pd.DataFrame(return_rows).set_index("ticker")["fwd_return"]
-
-    predictor.train(feat_df, fwd_series)
-    logger.info("XGBoost model trained and saved → %s", predictor.model_path)
+    predictor = ReturnPredictor()
+    logger.info("Running walk-forward training on %d rows …", len(panel_df))
+    oos_preds = predictor.train_walkforward(
+        panel_df, forward_return_col="fwd_return_60d"
+    )
+    valid_oos = oos_preds.dropna()
+    if len(valid_oos) > 0:
+        corr = float(
+            np.corrcoef(
+                valid_oos.values,
+                panel_df.loc[valid_oos.index, "fwd_return_60d"].values,
+            )[0, 1]
+        )
+        logger.info(
+            "Walk-forward OOS IC (rank corr proxy): %.4f  (%d samples)",
+            corr, len(valid_oos),
+        )
+    logger.info("Training complete. Model saved → %s", predictor.model_path)
 
 
 # ---------------------------------------------------------------------------
 # Utilities
 # ---------------------------------------------------------------------------
 
-
 def _print_table(df: pd.DataFrame) -> None:
-    """Pretty-print a DataFrame with column alignment."""
-    pd.set_option("display.max_colwidth",  60)
+    pd.set_option("display.max_colwidth",  55)
     pd.set_option("display.float_format", "{:.4f}".format)
     print("\n" + df.to_string(index=False) + "\n")
 
@@ -220,51 +238,56 @@ def _print_table(df: pd.DataFrame) -> None:
 # CLI
 # ---------------------------------------------------------------------------
 
-
 def _parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Stock analysis system",
+    p = argparse.ArgumentParser(
+        description="Stock screener — 1-3 month opportunity finder",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument(
-        "--tickers", nargs="+", default=DEFAULT_TICKERS,
-        metavar="TICKER", help="Ticker symbols to analyse",
+    p.add_argument(
+        "--mode", choices=["screen", "backtest", "train"],
+        default="screen",
+        help="Pipeline mode",
     )
-    parser.add_argument(
-        "--mode", choices=["live", "backtest", "train"],
-        default="live", help="Pipeline mode",
+    p.add_argument(
+        "--tickers", nargs="+", default=None, metavar="TICKER",
+        help="Explicit tickers (overrides universe scrape)",
     )
-    parser.add_argument(
+    p.add_argument(
+        "--top-n", type=int, default=settings.top_n,
+        metavar="N", help="Number of top picks to show",
+    )
+    p.add_argument(
         "--start", default="2023-01-01", metavar="YYYY-MM-DD",
-        help="Backtest start date",
+        help="Backtest / training start date",
     )
-    parser.add_argument(
+    p.add_argument(
         "--end", default=str(date.today()), metavar="YYYY-MM-DD",
         help="Backtest end date",
     )
-    parser.add_argument(
+    p.add_argument(
         "--db", default=settings.db_path, metavar="PATH",
         help="SQLite database path",
     )
-    parser.add_argument(
+    p.add_argument(
         "--backend", choices=["claude", "vllm"],
         default=settings.llm_backend,
-        help="LLM backend (overrides .env LLM_BACKEND)",
+        help="LLM backend (overrides .env)",
     )
-    parser.add_argument(
+    p.add_argument(
         "--no-llm", action="store_true",
-        help="Skip LLM call; print signal scores only",
+        help="Skip LLM call; show screener scores only",
     )
-    return parser.parse_args()
+    return p.parse_args()
 
 
 def main() -> None:
     args = _parse_args()
 
-    if args.mode == "live":
+    if args.mode == "screen":
         asyncio.run(
-            run_live(
+            run_screen(
                 tickers=args.tickers,
+                top_n=args.top_n,
                 db_path=args.db,
                 llm_backend=args.backend,
                 no_llm=args.no_llm,
@@ -275,7 +298,7 @@ def main() -> None:
         run_backtest(start=args.start, end=args.end, db_path=args.db)
 
     elif args.mode == "train":
-        asyncio.run(run_train(tickers=args.tickers, db_path=args.db))
+        asyncio.run(run_train(db_path=args.db, start=args.start))
 
 
 if __name__ == "__main__":
